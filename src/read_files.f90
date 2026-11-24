@@ -36,6 +36,7 @@ module read_files
    use soap_turbo_compress_module
    use xyz_module
    use md
+   use tensor_methods
 
 contains
 
@@ -594,6 +595,72 @@ contains
          end do
          close (unit_number)
       end if
+
+   end subroutine
+!**************************************************************************
+
+!**************************************************************************
+! STAGED (tensor readout): sibling of read_alphas_and_descriptors for a tensor
+! block. Same descriptor file; the alphas file has n_cols values per sparse point.
+   subroutine read_tensor_alphas_and_descriptors(file_desc, file_alphas, n_cols, n_sparse, alphas, Qs)
+
+      implicit none
+
+!   Input variables
+      character*1024, intent(in) :: file_desc, file_alphas
+      integer, intent(in) :: n_cols
+
+!   Output variables
+      real*8, allocatable, intent(out) :: alphas(:, :), Qs(:, :)
+      integer, intent(out) :: n_sparse
+
+!   Internal variables
+      integer :: i, j, iostatus, dim, unit_number
+
+!   One line per sparse point, so counting lines gives n_sparse
+      open (newunit=unit_number, file=file_alphas, status="old")
+      iostatus = 0
+      n_sparse = -1
+      do while (iostatus == 0)
+         read (unit_number, *, iostat=iostatus)
+         n_sparse = n_sparse + 1
+      end do
+      close (unit_number)
+
+!   One value per line, so the line count is dim*n_sparse
+      open (newunit=unit_number, file=file_desc, status="old")
+      iostatus = 0
+      i = -1
+      do while (iostatus == 0)
+         read (unit_number, *, iostat=iostatus)
+         i = i + 1
+      end do
+      close (unit_number)
+      if (n_sparse < 1 .or. mod(i, max(n_sparse, 1)) /= 0) then
+         write (*, *) "ERROR: bad tensor descriptor/alphas files, line counts do not match: ", trim(file_desc)
+         stop
+      end if
+      dim = i/n_sparse
+
+!   alphas(1:n_cols, i): each file line is one COLUMN, so the Python [M, K] rows read straight in
+      allocate (alphas(1:n_cols, 1:n_sparse))
+      allocate (Qs(1:dim, 1:n_sparse))
+      open (newunit=unit_number, file=file_alphas, status="old")
+      do i = 1, n_sparse
+         read (unit_number, *, iostat=iostatus) alphas(1:n_cols, i)
+         if (iostatus /= 0) then
+            write (*, *) "ERROR: could not read", n_cols, "alphas from line", i, "of ", trim(file_alphas)
+            stop
+         end if
+      end do
+      close (unit_number)
+      open (newunit=unit_number, file=file_desc, status="old")
+      do i = 1, n_sparse
+         do j = 1, dim
+            read (unit_number, *) Qs(j, i)
+         end do
+      end do
+      close (unit_number)
 
    end subroutine
 !**************************************************************************
@@ -2163,7 +2230,7 @@ contains
                               n_distance_2b, distance_2b_hypers, &
                               n_angle_3b, angle_3b_hypers, &
                               n_core_pot, core_pot_hypers, &
-                              rcut_max, do_prediction, params)
+                              rcut_max, do_prediction, params, readout)
 
       implicit none
 
@@ -2171,6 +2238,11 @@ contains
       type(input_parameters), intent(in) :: params
       logical, intent(in) :: do_prediction
       character(len=*), intent(in) :: file_gap
+!   STAGED (tensor readout): intent(out) resets it to the type's defaults (energy model)
+      type(tensor_readout), intent(out) :: readout
+      character*64 :: tensor_string
+      character*8, allocatable :: tensor_species(:)
+      logical :: tensor_logical
 
 !   Output variables
       real*8, intent(out) :: rcut_max
@@ -2416,6 +2488,10 @@ contains
                   else if (keyword == "desc_sparse") then
                      backspace (10)
                      read (10, *, iostat=iostatus) cjunk, cjunk, soap_turbo_hypers(n_soap_turbo)%file_desc
+!             STAGED (tensor readout): K of this block; 0 (the default) for an energy block
+                  else if (keyword == "n_columns") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, soap_turbo_hypers(n_soap_turbo)%n_columns
                   else if (keyword == "has_vdw") then
                      backspace (10)
                      !               read(10, *, iostat=iostatus) cjunk, cjunk, soap_turbo_hypers(n_soap_turbo)%has_vdw
@@ -2548,8 +2624,30 @@ contains
                                                                     soap_turbo_hypers(n_soap_turbo)%rcut_soft(i)
                   end if
                end do
-!         Read the sparse set information
-               if (do_prediction) then
+!         STAGED (tensor readout): a tensor block is tested FIRST. do_prediction is
+!         still .true. here in a "turbogap predict" run, and the energy reader below
+!         would silently take column 1 of a K-column alphas file.
+               if (soap_turbo_hypers(n_soap_turbo)%n_columns > 0 .and. .not. readout%is_tensor) then
+                  write (*, *) "ERROR: a soap_turbo block has n_columns > 0 but no tensor_readout block came before it"
+                  stop
+               end if
+               if (readout%is_tensor) then
+                  if (soap_turbo_hypers(n_soap_turbo)%n_columns /= readout%n_columns) then
+                     write (*, *) "ERROR: soap_turbo block n_columns =", soap_turbo_hypers(n_soap_turbo)%n_columns, &
+                        "but the tensor_readout block gives K =", readout%n_columns
+                     write (*, *) "       (K = 0 means get_readout_sizes in tensor_methods.f90 is not written yet)"
+                     stop
+                  end if
+                  call read_tensor_alphas_and_descriptors(soap_turbo_hypers(n_soap_turbo)%file_desc, &
+                                                          soap_turbo_hypers(n_soap_turbo)%file_alphas, &
+                                                          soap_turbo_hypers(n_soap_turbo)%n_columns, &
+                                                          soap_turbo_hypers(n_soap_turbo)%n_sparse, &
+                                                          soap_turbo_hypers(n_soap_turbo)%alphas_tensor, &
+                                                          soap_turbo_hypers(n_soap_turbo)%Qs)
+!           The existing MPI broadcast sends the rank-1 alphas unconditionally, so it must exist
+                  allocate (soap_turbo_hypers(n_soap_turbo)%alphas(1:soap_turbo_hypers(n_soap_turbo)%n_sparse))
+                  soap_turbo_hypers(n_soap_turbo)%alphas = 0.d0
+               else if (do_prediction) then
                   call read_alphas_and_descriptors(soap_turbo_hypers(n_soap_turbo)%file_desc, &
                                                    soap_turbo_hypers(n_soap_turbo)%file_alphas, &
                                                    soap_turbo_hypers(n_soap_turbo)%n_sparse, &
@@ -2674,6 +2772,101 @@ contains
                   soap_turbo_hypers(n_soap_turbo)%dim = soap_turbo_hypers(n_soap_turbo)%n_max* &
                                                         (soap_turbo_hypers(n_soap_turbo)%n_max + 1)/2* &
                                                         (soap_turbo_hypers(n_soap_turbo)%l_max + 1)
+               end if
+!         STAGED (tensor readout): the existing broadcast sizes Qs with %dim, so the
+!         sparse file must have exactly the width this SOAP block produces.
+               if (readout%is_tensor) then
+                  if (size(soap_turbo_hypers(n_soap_turbo)%Qs, 1) /= soap_turbo_hypers(n_soap_turbo)%dim) then
+                     write (*, *) "ERROR: desc_sparse has descriptor width", size(soap_turbo_hypers(n_soap_turbo)%Qs, 1), &
+                        "but this soap_turbo block produces", soap_turbo_hypers(n_soap_turbo)%dim
+                     stop
+                  end if
+               end if
+!       STAGED (tensor readout): the block that makes this .gap a dipole/polarisability
+!       model. It must come before the soap_turbo blocks (they need K when they load).
+            else if (keyword == "tensor_readout") then
+               iostatus = 0
+               do while (keyword /= "gap_end" .and. iostatus == 0)
+                  read (10, *, iostat=iostatus) keyword
+                  if (keyword == "target") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, tensor_string
+                     if (tensor_string == "dipole" .or. tensor_string == "1") then
+                        readout%model_type = model_dipole
+                     else if (tensor_string == "polarisability" .or. tensor_string == "polarizability" .or. &
+                              tensor_string == "pol" .or. tensor_string == "2") then
+                        readout%model_type = model_polarisability
+                     else
+                        write (*, *) "ERROR: tensor_readout target must be dipole or polarisability, got ", trim(tensor_string)
+                        stop
+                     end if
+                  else if (keyword == "rcut") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, readout%rcut
+                  else if (keyword == "n_channels") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, readout%n_channels
+                  else if (keyword == "cross_channels") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, readout%cross_channels
+!             The remaining keywords are hard-coded choices: parsed only to refuse
+!             a model that was fitted with something else.
+                  else if (keyword == "species") then
+                     backspace (10)
+                     allocate (tensor_species(1:size(params%species_types)))
+                     read (10, *, iostat=iostatus) cjunk, cjunk, tensor_species
+                     if (iostatus /= 0 .or. any(tensor_species /= params%species_types)) then
+                        write (*, *) "ERROR: tensor_readout species must match the input file species, in the same order"
+                        stop
+                     end if
+                     deallocate (tensor_species)
+                  else if (keyword == "radial") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, tensor_string
+                     if (tensor_string /= "chebyshev_warped") then
+                        write (*, *) "ERROR: tensor_readout radial must be chebyshev_warped, got ", trim(tensor_string)
+                        stop
+                     end if
+                  else if (keyword == "cutoff_function") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, tensor_string
+                     if (tensor_string /= "cosine") then
+                        write (*, *) "ERROR: tensor_readout cutoff_function must be cosine, got ", trim(tensor_string)
+                        stop
+                     end if
+                  else if (keyword == "species_pairs") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, tensor_string
+                     if (tensor_string == "off") then
+                        write (*, *) "ERROR: tensor_readout species_pairs = off is not implemented"
+                        stop
+                     end if
+                  else if (keyword == "unit_vector") then
+                     backspace (10)
+                     read (10, *, iostat=iostatus) cjunk, cjunk, tensor_logical
+                     if (.not. tensor_logical) then
+                        write (*, *) "ERROR: tensor_readout unit_vector must be true (full bond vectors are not implemented)"
+                        stop
+                     end if
+                  end if
+               end do
+               readout%is_tensor = (readout%model_type /= model_energy)
+               if (.not. readout%is_tensor) then
+                  write (*, *) "ERROR: the tensor_readout block has no target keyword"
+                  stop
+               end if
+               if (readout%rcut <= 0.d0 .or. readout%n_channels < 1 .or. readout%cross_channels < 0) then
+                  write (*, *) "ERROR: tensor_readout needs rcut > 0, n_channels >= 1 and cross_channels >= 0"
+                  stop
+               end if
+               if (readout%model_type == model_dipole .and. readout%cross_channels /= 0) then
+                  write (*, *) "ERROR: the dipole cross group is not implemented; cross_channels must be 0"
+                  stop
+               end if
+!         D, K1 and K follow from the numbers just read (YOUR routine)
+               call get_readout_sizes(readout, size(params%species_types))
+               if (readout%rcut > rcut_max) then
+                  rcut_max = readout%rcut
                end if
 !       distance_2b definitions here
             else if (keyword == "distance_2b") then

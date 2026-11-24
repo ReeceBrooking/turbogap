@@ -52,6 +52,7 @@ program turbogap
 #endif
   use bussi
   use xyz_module
+  use tensor_methods
 
   implicit none
 
@@ -168,6 +169,12 @@ program turbogap
   type(distance_2b), allocatable :: distance_2b_hypers(:)
   type(angle_3b), allocatable :: angle_3b_hypers(:)
   type(core_pot), allocatable :: core_pot_hypers(:)
+
+  ! STAGED (tensor readout): model description, geometry of this rank's atoms
+  ! v_readout(1:D, 1:K, i_beg:i_end), and the frame total (3 or 6 numbers used).
+  type(tensor_readout) :: readout
+  real*8, allocatable :: v_readout(:,:,:)
+  real*8 :: tensor_pred(1:6) = 0.d0, this_tensor_pred(1:6) = 0.d0
 
   !vdw crap
   real*8, allocatable :: v_neigh_vdw(:), energies_vdw(:), forces_vdw(:,:), this_energies_vdw(:), this_forces_vdw(:,:)
@@ -469,7 +476,7 @@ program turbogap
              n_angle_3b, angle_3b_hypers, &
              n_core_pot, core_pot_hypers, &
              rcut_max, params%do_prediction, &
-             params )
+             params, readout )
         !   Check if vdw_rcut is bigger
         if( params%vdw_rcut > rcut_max )then
            rcut_max = params%vdw_rcut
@@ -534,6 +541,16 @@ program turbogap
           & MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
      call mpi_bcast(valid_vdw, 1,&
           & MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+     !   STAGED (tensor readout): only what was read from the file is sent; the
+     !   derived fields are recomputed on each rank below.
+     call mpi_bcast(readout%model_type, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+     call mpi_bcast(readout%rcut, 1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+     call mpi_bcast(readout%n_channels, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+     call mpi_bcast(readout%cross_channels, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+     readout%is_tensor = (readout%model_type /= model_energy)
+     if( readout%is_tensor )then
+        call get_readout_sizes(readout, n_species)
+     end if
 
      !   Processes other than 0 need to allocate the data structures on their own
      call cpu_time(time_mpi(2))
@@ -687,6 +704,15 @@ program turbogap
            call mpi_bcast(soap_turbo_hypers(i)%compress_P_i(1:cPnz), cPnz, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
            call mpi_bcast(soap_turbo_hypers(i)%compress_P_j(1:cPnz), cPnz, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
         end if
+        !   STAGED (tensor readout): Qs, n_sparse, delta and zeta were sent just above
+        !   by the existing lines; only the K-column alphas are new.
+        call mpi_bcast(soap_turbo_hypers(i)%n_columns, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+        if( readout%is_tensor )then
+           n_nonzero = soap_turbo_hypers(i)%n_columns
+           if( rank /= 0 )allocate( soap_turbo_hypers(i)%alphas_tensor(1:n_nonzero, 1:n_sparse) )
+           call mpi_bcast(soap_turbo_hypers(i)%alphas_tensor, n_nonzero*n_sparse, MPI_DOUBLE_PRECISION, 0, &
+                MPI_COMM_WORLD, ierr)
+        end if
         call mpi_bcast(soap_turbo_hypers(i)%has_local_properties, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         call mpi_bcast(soap_turbo_hypers(i)%has_core_electron_be, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         if (valid_xps .or. params%do_xps) call mpi_bcast(core_be_lp_index, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
@@ -803,6 +829,22 @@ program turbogap
           & local_properties_dim_mpi_soap_turbo,&
           & local_properties_n_sparse_mpi_soap_turbo )
 #endif
+     ! STAGED (tensor readout): a tensor model has no energies or forces. Switching
+     ! the energy path off here (every rank, MPI or serial) makes the existing code
+     ! skip itself, so none of it needs editing. The output flags follow what
+     ! read_input_file does for do_forces = .false.
+     if( readout%is_tensor )then
+        if( params%do_md .or. params%do_mc )then
+           write(*,*) "ERROR: a dipole/polarisability .gap file cannot be used for MD or MC"
+           stop
+        end if
+        params%do_prediction = .false.
+        params%do_forces = .false.
+        params%do_derivatives = .false.
+        params%write_property(4) = .false.
+        params%write_property(7:9) = .false.
+        params%write_array_property(4:5) = .false.
+     end if
   else
 #ifdef _MPIF90
      IF( rank == 0 )THEN
@@ -1302,7 +1344,8 @@ program turbogap
 
      !**************************************************************************
      !   If we are doing prediction, we run this chunk of code
-     if( params%do_prediction .or. params%write_soap .or. params%write_derivatives)then
+     !   STAGED (tensor readout): a tensor model also runs this block
+     if( params%do_prediction .or. params%write_soap .or. params%write_derivatives .or. readout%is_tensor )then
         call cpu_time(time1)
 
         !     We only need to reallocate the arrays if the number of sites changes
@@ -1520,6 +1563,18 @@ end if
         energies = this_energies
 #endif
 
+        !     STAGED (tensor readout): geometry once per frame for this rank's atoms,
+        !     shared by every SOAP block. Slices are passed as in the 2b energy call.
+        if( readout%is_tensor )then
+           tensor_pred = 0.d0
+           if( allocated(v_readout) )deallocate( v_readout )
+           allocate( v_readout(1:readout%n_dim, 1:readout%n_columns, i_beg:i_end) )
+           if( i_end >= i_beg )then
+              call get_readout_geometry( n_neigh(i_beg:i_end), rjs(j_beg:j_end), xyz(1:3, j_beg:j_end), &
+                   neighbor_species(j_beg:j_end), n_species, readout, v_readout )
+           end if
+        end if
+
         !     Loop through soap_turbo descriptors - we always call this routine, even if we don't want to do prediction
         n_lp_count = 0 ! This counts the local properties
         do i = 1, n_soap_turbo
@@ -1609,7 +1664,9 @@ end if
                    & this_energies, this_forces, this_local_properties_pt,&
                    & this_local_properties_cart_der_pt,&
                    & local_property_indexes, this_i_beg, this_i_end, this_j_beg, this_j_end, &
-                   & this_virial, n_lp_count )
+                   & this_virial, n_lp_count, &
+                   ! STAGED (tensor readout): flag, this block's alphas, geometry, running total
+                   & readout%is_tensor, soap_turbo_hypers(i)%alphas_tensor, v_readout, tensor_pred )
 
 
               ! We can have a pointer to specific parts of this_local_properties array to then
@@ -1793,6 +1850,14 @@ end if
 
         end do
 
+        !     STAGED (tensor readout): each rank summed its own atoms; add them up on
+        !     rank 0, which is the only one that writes.
+#ifdef _MPIF90
+        if( readout%is_tensor )then
+           call mpi_reduce(tensor_pred, this_tensor_pred, 6, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+           tensor_pred = this_tensor_pred
+        end if
+#endif
 
 #ifdef _MPIF90
         if( any( soap_turbo_hypers(:)%has_local_properties) )then
@@ -3391,7 +3456,8 @@ end if
 
 
 
-        if( params%do_prediction .and. .not. params%do_md .and. .not. params%do_mc)then
+        !     STAGED (tensor readout): a tensor model writes its frame here too
+        if( (params%do_prediction .or. readout%is_tensor) .and. .not. params%do_md .and. .not. params%do_mc)then
 #ifdef _MPIF90
            IF( rank == 0 )then
 #endif
@@ -3408,6 +3474,13 @@ end if
                    & params%valid_pdf, params%valid_sf, params%valid_xrd, params%valid_nd, params%do_pair_distribution,&
                    & params%do_structure_factor, params%do_xrd, params%do_nd, string)
 
+              !       STAGED (tensor readout): two optional arguments added to the call. For an
+              !       energy model n_dim = 0, the slice is empty and nothing extra is written.
+              !       "dipole" and "pol" are the keys the TNEP Python reads.
+              temp_string = "dipole"
+              if( readout%model_type == model_polarisability )temp_string = "pol"
+              !       forces is passed below but is never allocated without do_forces
+              if( readout%is_tensor .and. .not. allocated(forces) )allocate( forces(1:3, 1:n_sites) )
               call write_extxyz( n_sites, -n_xyz, md_time, time_step,&
                    & instant_temp, instant_pressure, a_box&
                    &/dfloat(indices(1)), b_box/dfloat(indices(2)),&
@@ -3416,7 +3489,8 @@ end if
                    & energies(1:n_sites), masses, params&
                    &%write_property, params%write_array_property,&
                    & params%write_local_properties, local_property_labels, local_properties, &
-                   & fix_atom, "trajectory_out.xyz", string, .false.)
+                   & fix_atom, "trajectory_out.xyz", string, .false., &
+                   & tensor=tensor_pred(1:readout%n_dim), tensor_label=trim(temp_string))
 
 #ifdef _MPIF90
            END IF
@@ -4885,10 +4959,15 @@ end if
   if ( allocated( this_energies_nd ) )      deallocate( this_energies_nd)
 
 
+              ! STAGED (tensor readout): guard added. This leftover debug dump read
+              ! forces_vdw even when forces were never computed, ending every such
+              ! run (including tensor runs) with a runtime error after the output.
+              if ( allocated( forces_vdw ) ) then
               do i = 1, n_sites
                  write(90, "(F20.8, 1X, F20.8, 1X, F20.8)") &
                       forces_vdw(1,i), forces_vdw(2,i), forces_vdw(3,i)
               end do
+              end if
 
 
   if ( allocated( forces ))          deallocate( forces )

@@ -32,6 +32,7 @@ module gap_interface
    use read_files
    use local_prop
    use types
+   use tensor_methods
 contains
 
 !**************************************************************************
@@ -50,9 +51,20 @@ contains
                            energies0, forces0, local_properties0,&
                            & local_properties_cart_der0,&
                            & local_property_indexes, this_i_beg, this_i_end, this_j_beg,&
-                           & this_j_end, virial, lp_index)
+                           & this_j_end, virial, lp_index, &
+                           is_tensor, alphas_tensor, v_readout, tensor0)
 
       implicit none
+
+      !   STAGED (tensor readout). The two arrays are "allocatable" dummies so that
+      !   (a) an energy run can pass them unallocated, and (b) v_readout keeps the
+      !   caller's bounds: its last index is the GLOBAL atom id.
+      logical, intent(in) :: is_tensor
+      real*8, allocatable, intent(in) :: alphas_tensor(:, :), v_readout(:, :, :)
+      !   Running total over blocks and chunks, so inout and only ever added to
+      real*8, intent(inout) :: tensor0(:)
+      real*8, allocatable :: site_scalars(:, :), v_sites(:, :, :)
+      integer :: n_dim_tensor
 
       !   Input variables
       type(local_property_soap_turbo), allocatable, intent(in) :: local_property_models(:)
@@ -244,6 +256,25 @@ contains
                        amplitude_scaling, radial_enhancement, central_weight, basis, scaling_mode, do_timing, &
                        do_derivatives, compress_soap, compress_P_nonzero, compress_P_i, compress_P_j, &
                        compress_P_el, soap, soap_cart_der)
+      end if
+
+      !###########################################!
+      !###---   STAGED: tensor readout      ---###!
+      !###########################################!
+
+      !   Outside "if (do_prediction)": a tensor model has no energies.
+      if (is_tensor .and. n_sites > 0) then
+         n_dim_tensor = size(v_readout, 1)
+         allocate (site_scalars(1:n_sites, 1:size(alphas_tensor, 1)))
+         allocate (v_sites(1:n_dim_tensor, 1:size(v_readout, 2), 1:n_sites))
+         !   soap holds only this block's central species, in a chunk of the rank's
+         !   atoms; in_to_out_site(i) is the global id of its i-th column.
+         do i = 1, n_sites
+            v_sites(:, :, i) = v_readout(:, :, in_to_out_site(i))
+         end do
+         call get_site_scalars(soap, Qs, alphas_tensor, delta, zeta, site_scalars)
+         call contract_readout(site_scalars, v_sites, tensor0(1:n_dim_tensor))
+         deallocate (site_scalars, v_sites)
       end if
 
       !###########################################!

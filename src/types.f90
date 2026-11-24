@@ -31,6 +31,24 @@ module types
 
    implicit none
 
+   ! STAGED (tensor readout): what the .gap file predicts. Fortran has no enum,
+   ! so named integer constants play that role. Compare against the names.
+   integer, parameter :: model_energy = 0, model_dipole = 1, model_polarisability = 2
+
+   ! STAGED (tensor readout): the "tensor_readout" block of the .gap file.
+   ! Defaults describe an ordinary energy GAP, which has no such block.
+   type tensor_readout
+      integer :: model_type = model_energy
+      logical :: is_tensor = .false.   ! .true. for dipole or polarisability
+      real*8  :: rcut = 0.d0           ! r_c of the readout
+      integer :: n_channels = 0        ! C
+      integer :: cross_channels = 0    ! C_x
+      ! Derived by get_readout_sizes (tensor_methods.f90), never set by hand:
+      integer :: n_dim = 0             ! D: 3 (dipole) or 6 (polarisability)
+      integer :: n_cross = 0           ! K1 = C_x * n_species
+      integer :: n_columns = 0         ! K: columns of v_i
+   end type tensor_readout
+
    ! GAP+descriptor data structure for SOAP
    type exp_data_container
       character*1024      :: file_data = "none", label, input = "default"
@@ -75,6 +93,11 @@ module types
       logical :: compress_soap = .false., has_vdw = .false.,&
            & has_core_electron_be = .false., has_local_properties = .false.
       type(local_property_soap_turbo), allocatable :: local_property_models(:)
+      ! STAGED (tensor readout): a tensor block differs from an energy block only
+      ! in its alphas, which have K columns: alphas_tensor(1:K, 1:n_sparse).
+      ! Qs, n_sparse, zeta and delta are the existing fields above.
+      real*8, allocatable :: alphas_tensor(:, :)
+      integer :: n_columns = 0
    end type soap_turbo
 
 ! GAP+descriptor data structure for distance_2b

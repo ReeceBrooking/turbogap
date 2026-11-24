@@ -133,9 +133,14 @@ module xyz_module
                            & write_array_property,&
                            & write_local_properties,&
                            & local_property_labels, local_properties, fix_atom,&
-                           & filename , string,  overwrite )
+                           & filename , string,  overwrite, tensor, tensor_label )
 
     implicit none
+
+!   STAGED (tensor readout): optional, so the other seven calls of this routine
+!   stay as they are. Written to the header as  tensor_label="t1 t2 ...".
+    real*8, intent(in), optional :: tensor(:)
+    character(len=*), intent(in), optional :: tensor_label
 
 !   In variables:
     real*8, intent(in) :: md_time, dt, temperature, pressure, a_cell(1:3), b_cell(1:3), c_cell(1:3), virial(1:3,1:3)
@@ -349,6 +354,14 @@ module xyz_module
       end if
     end if
     !
+!   STAGED (tensor readout): 3 numbers (dipole) or 6 (polarisability, Voigt
+!   xx yy zz xy yz zx), at full precision so it can be compared with Python.
+    if( present(tensor) .and. present(tensor_label) )then
+     if( size(tensor) > 0 )then
+      write(10, '(1X,A,A,*(ES24.15))', advance="no") trim(tensor_label), '="', tensor
+      write(10, '(A)', advance="no") '"'
+     end if
+    end if
 
 
 !   Advance

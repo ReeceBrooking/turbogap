@@ -18,10 +18,11 @@ LIB_DIR=lib
 
 F90_OPTS += $(F90_MOD_DIR_OPT) $(INC_DIR)
 
-PROGRAMS := turbogap
+# STAGED: tensor_test checks the tensor_methods routines one by one
+PROGRAMS := turbogap tensor_test
 
 
-SRC := misc.f90 constants.f90 nonneg_leastsq.f90 splines.f90 types.f90 neighbors.f90 gap.f90 vdw.f90		\
+SRC := misc.f90 constants.f90 nonneg_leastsq.f90 splines.f90 types.f90 tensor_methods.f90 neighbors.f90 gap.f90 vdw.f90		\
 	local_properties.f90 exp_utils.f90  xyz.f90 md.f90 mc.f90 read_files.f90	\
 	gap_interface.f90 mpi.f90 exp_interface.f90
 
