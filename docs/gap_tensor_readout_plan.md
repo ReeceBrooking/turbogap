@@ -4,7 +4,7 @@
 (χ, 6 Voigt components) model on each frame TurboGAP reads, and write the
 result to the output xyz.
 
-**Reference:** `TNEP/docs/gap_forward_pass.md` (called "the guide" below;
+**Reference:** `docs/gap_forward_pass.md` (called "the guide" below;
 section numbers refer to it). The Python oracle is `gap_dipole.predict`.
 
 **Scope:** forward pass only. No forces, no derivatives, no fitting.
