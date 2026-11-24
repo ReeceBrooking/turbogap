@@ -1,30 +1,3 @@
-! HND XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-! HND X
-! HND X   TurboGAP
-! HND X
-! HND X   TurboGAP is copyright (c) 2019-2023, Miguel A. Caro and others
-! HND X
-! HND X   TurboGAP is published and distributed under the
-! HND X      Academic Software License v1.0 (ASL)
-! HND X
-! HND X   This file, tensor_methods.f90, is copyright (c) 2026, <YOUR NAME HERE>
-! HND X
-! HND X   TurboGAP is distributed in the hope that it will be useful for non-commercial
-! HND X   academic research, but WITHOUT ANY WARRANTY; without even the implied
-! HND X   warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-! HND X   ASL for more details.
-! HND X
-! HND X   You should have received a copy of the ASL along with this program
-! HND X   (e.g. in a LICENSE.md file); if not, you can write to the original
-! HND X   licensor, Miguel Caro (mcaroba@gmail.com). The ASL is also published at
-! HND X   http://github.com/gabor1/ASL
-! HND X
-! HND X   When using this software, please cite the following reference:
-! HND X
-! HND X   Miguel A. Caro. Phys. Rev. B 100, 024112 (2019)
-! HND X
-! HND XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-
 ! Dipole and polarisability readout for SOAP GAP models (forward pass only).
 !
 ! STAGED FILE. Every routine below has its interface fixed, because the rest of
@@ -68,9 +41,16 @@ module tensor_methods
 !   Internal variables
 
 !   YOUR CODE
-    readout%n_dim = 0
-    readout%n_cross = 0
-    readout%n_columns = 0
+    select case( readout%model_type)
+    case(model_dipole)
+        readout%n_dim = 3
+        readout%n_cross = 0
+        readout%n_columns = readout%n_channels * n_species
+    case(model_polarisability)
+        readout%n_dim = 6
+        readout%n_cross = readout%cross_channels * n_species
+        readout%n_columns = 2 * readout%n_channels * n_species + readout%n_cross * (readout%n_cross + 1) / 2
+    end select
 !   END YOUR CODE
 
   end subroutine
@@ -93,9 +73,11 @@ module tensor_methods
 !   Output variables
     real*8 :: fcut
 !   Internal variables
+    real*8 :: pi
 
 !   YOUR CODE
-    fcut = 0.d0
+    pi = dacos(-1.d0)
+    fcut = 0.5d0*(1.d0 + dcos((pi * r) / rcut))
 !   END YOUR CODE
 
   end function
@@ -121,9 +103,20 @@ module tensor_methods
 !   Output variables
     real*8, intent(out) :: radial(1:n_channels)
 !   Internal variables
-
+    integer :: n
+    real*8 :: x
 !   YOUR CODE
-    radial = 0.d0
+    x = 2.d0 * ((r / rcut) - 1.d0)**2 - 1.d0
+    radial(1) = 1.d0
+    if (n_channels > 1) then
+        radial(2) = x
+    end if
+    if (n_channels > 2) then
+        do n = 3, n_channels
+            radial(n) = 2.d0 * x * radial(n-1) - radial(n-2)
+        end do
+    end if
+    radial = radial * cosine_cutoff(r, rcut)
 !   END YOUR CODE
 
   end subroutine
@@ -160,9 +153,92 @@ module tensor_methods
 !   Output variables
     real*8, intent(out) :: v(:, :, :)
 !   Internal variables
+    integer :: i, j, col, n, g, k, p, q, pair
+    real*8 :: r_unit(1:3)
+    real*8 :: radial(1:readout%n_channels)
+    real*8 :: geom(1:6, 1:2)
+    real*8 :: cross(1:3, readout%n_cross), a(1:3), b(1:3)
+    real*8 :: tr
+!   CROSS GROUP, declarations: you will need
+!     - an array for this atom's cross vectors, 3 components x K1 slots
+!       (K1 = readout%n_cross; it can be sized like radial is, from readout)
+!     - integers for the two slots p, q and for a running column counter
+!   Note: radial has C entries and the cross group reads the first C_x of
+!   them, which is fine as long as C_x <= C.
 
 !   YOUR CODE
     v = 0.d0
+    select case( readout%model_type )
+    case( model_dipole)
+        k = 0
+        do i = 1, size(n_neigh)
+            do j = 1, n_neigh(i)
+                k = k + 1
+                if( j == 1 )cycle
+                if( rjs(k) >= readout%rcut )cycle
+                r_unit = xyz(:, k) / rjs(k)
+                call radial_basis(rjs(k), readout%rcut, readout%n_channels, radial)
+                do n = 1, readout%n_channels
+                    col = (n - 1) * n_species + neighbor_species(k)
+                    v(1:3, col, i) = v(1:3, col, i) + radial(n)*r_unit
+                end do
+            end do
+        end do
+    case(model_polarisability)
+            k = 0
+            do i = 1, size(n_neigh)
+!               CROSS GROUP, step 1 (once per atom, before its neighbours):
+!               set the cross-vector array to zero. It belongs to atom i only.
+                cross = 0.d0
+                do j = 1, n_neigh(i)
+                    k = k + 1
+                    if( j == 1 )cycle
+                    if( rjs(k) >= readout%rcut )cycle
+                    r_unit = xyz(:, k) / rjs(k)
+                    geom(:, 1) = [1.d0, 1.d0, 1.d0, 0.d0, 0.d0, 0.d0]
+                    geom(:, 2) = [r_unit(1)**2 - 1.d0/3.d0, r_unit(2)**2 - 1.d0/3.d0, r_unit(3)**2 - 1.d0/3.d0, &
+                        r_unit(1) * r_unit(2), r_unit(2) * r_unit(3), r_unit(1) * r_unit(3)]
+                    call radial_basis(rjs(k), readout%rcut, readout%n_channels, radial)
+                    do n = 1, readout%cross_channels
+                        col = (n - 1) * n_species + neighbor_species(k)
+                        cross(1:3, col) = cross(1:3, col) + radial(n)*r_unit
+                    end do
+                    do g = 1, 2
+                        do n = 1, readout%n_channels
+                            col = (g - 1) * n_species * readout%n_channels + (n - 1) * n_species + neighbor_species(k)
+                            v(1:6, col, i) = v(1:6, col, i) + radial(n)*geom(:, g)
+                        end do
+                    end do
+!                   CROSS GROUP, step 2 (once per neighbour, still inside the j loop):
+!                   add this pair to the cross vectors. Same as your dipole line,
+!                   but into the cross-vector array, for n = 1 .. C_x only:
+!                     slot = (n - 1)*n_species + neighbor_species(k)
+!                     cross vector(slot) = cross vector(slot) + radial(n)*r_unit
+                end do
+!               CROSS GROUP, step 3 (once per atom, after ALL its neighbours):
+!               the cross vectors are now complete sums. Turn them into columns:
+!                 loop p = 1 .. K1, and inside it q = p .. K1   (pairs with p <= q)
+!                 count the pairs as you go: 1, 2, 3, ...
+!                 for each pair build the symmetric 3x3 product of vector p and
+!                   vector q:  S(a,b) = 0.5*( vp(a)*vq(b) + vq(a)*vp(b) )
+!                 subtract a third of its trace from the diagonal
+!                 store (Sxx, Syy, Szz, Sxy, Syz, Szx) in column
+!                   2*C*T + (pair count)   of v(1:6, :, i)
+                pair = 0
+                do p = 1, readout%n_cross
+                    do q = p, readout%n_cross
+                        pair = pair + 1
+                        col = 2 * readout%n_channels * n_species + pair
+                        a = cross(:, p)
+                        b = cross(:, q)
+                        tr = a(1)*b(1) + a(2)*b(2) + a(3)*b(3)
+                        v(1:6, col, i) = [a(1)*b(1) - tr/3.d0, a(2)*b(2) - tr/3.d0, a(3)*b(3) - tr/3.d0, &
+                            0.5d0*(a(1)*b(2) + a(2)*b(1)), 0.5d0*(a(2)*b(3) + a(3)*b(2)), 0.5d0*(a(3)*b(1) + a(1)*b(3))]
+                    end do
+                end do
+
+            end do  
+    end select
 !   END YOUR CODE
 
   end subroutine
